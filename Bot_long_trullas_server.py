@@ -122,18 +122,13 @@ def lista_estrategias(sel):
 # ===========================
 # TELEGRAM
 # ===========================
+
 def cargar_config_telegram():
     global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-    if not os.path.exists(CONFIG_TELEGRAM_FILE):
-        log_consola(f"⚠️ No existe {os.path.basename(CONFIG_TELEGRAM_FILE)}. Créalo con 'bot_token' y 'chat_id'.")
-        return
-    try:
-        with open(CONFIG_TELEGRAM_FILE, "r", encoding="utf-8") as f:
-            config = json.load(f)
-            TELEGRAM_TOKEN = config.get("bot_token")
-            TELEGRAM_CHAT_ID = config.get("chat_id")
-    except Exception as e:
-        log_consola(f"⚠️ Error leyendo {os.path.basename(CONFIG_TELEGRAM_FILE)}: {e}")
+    TELEGRAM_TOKEN = os.environ.get("bot_token")
+    TELEGRAM_CHAT_ID = os.environ.get("chat_id")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log_consola("⚠️ No se encontraron 'bot_token' o 'chat_id' en las variables de entorno.")
 
 def _telegram_listo(log):
     if not TELEGRAM_TOKEN:
