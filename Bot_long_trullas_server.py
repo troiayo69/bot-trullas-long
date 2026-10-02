@@ -8,7 +8,7 @@ de las ENTRADAS LONG según esta regla (la misma que el backtest):
   1. El precio estaba bajo la EMA 70 y la cruza al alza.
   2. Confirmación: la vela SIGUIENTE al cruce cierra al menos `confirmacion_pct` %
      por encima de la EMA 70. La señal es esa vela de confirmación (última vela cerrada).
-  3. Filtros: volumen, precio mínimo, RSI máximo, mercado (SPY sobre su SMA200),
+  3. Filtros: EMA 200 por debajo de la EMA 70 (obligatorio), volumen, precio mínimo, RSI máximo, mercado (SPY sobre su SMA200),
      resultados próximos. (ADX y tendencia EMA70/200 desactivados por defecto.)
 
   Stop sugerido: bajo el mínimo de las últimas 10 velas (máx. 3 ATR; mín. 0,5 ATR).
@@ -87,6 +87,7 @@ DEFAULTS = {
     "ema_fast": 6, "ema_mid": 70, "ema_slow": 200,
     "confirmacion_pct": 1.0,      # % mínimo sobre la EMA 70 de la vela siguiente al cruce (None = sin confirmación)
     "exigir_tendencia": False,    # True = exige EMA 70 y 200 subiendo y precio > EMA 200
+    "ema200_bajo_ema70": True,    # OBLIGATORIO: la EMA 200 debe estar por debajo de la EMA 70 en la vela de la señal
     "pendiente_barras": 5,
     "dias_min_salida": 5,         # solo informativo (se muestra en el aviso)
     # MACD (solo para la puntuación)
@@ -139,7 +140,8 @@ def guardar_json_seguro(ruta, datos):
 def nombre_modelo(p):
     conf = p.get("confirmacion_pct")
     txt_conf = "sin confirmación" if conf is None or float(conf) < 0 else f"confirmación {float(conf):g} %"
-    return f"EMA {p['ema_fast']}/{p['ema_mid']}/{p['ema_slow']} · cruce EMA {p['ema_mid']} + {txt_conf}"
+    extra = f" · EMA {p['ema_slow']} bajo EMA {p['ema_mid']}" if p.get("ema200_bajo_ema70", True) else ""
+    return f"EMA {p['ema_fast']}/{p['ema_mid']}/{p['ema_slow']} · cruce EMA {p['ema_mid']} + {txt_conf}{extra}"
 
 
 # ===========================
@@ -402,6 +404,8 @@ def calcular_senal(df, p, mercado=None):
     gatillo = (gatillo & calentado).astype(bool)
 
     filtros = pd.DataFrame(index=df.index)
+    if p.get("ema200_bajo_ema70", True):
+        filtros["ema200"] = df["ema_s"] < df["ema_m"]
     if p["filtro_volumen"]:
         filtros["volumen"] = df["vol_media"] >= float(p["volumen_min"])
     if p["filtro_precio"]:
@@ -718,3 +722,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
