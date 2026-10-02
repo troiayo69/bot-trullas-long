@@ -1,15 +1,33 @@
 #!/usr/bin/env python3
 """
-Bot_Long_Trullas_Server.py — v2 PRO (Versión Servidor / PythonAnywhere)
-Escáner de señales de ENTRADA LONG optimizado para ejecución headless (sin interfaz gráfica).
-Mantiene: Estrategias EMA/SMMA, Filtros, Gestión de Riesgo, Backtest y Notificaciones Telegram.
-SIN GRÁFICOS: Solo texto + enlaces a TradingView (más rápido y eficiente para servidores).
+Bot_long_trullas_server.py — v3 · MODELO EMA 70 (servidor / GitHub Actions)
+
+Escanea la lista de activos (assets_trullas.txt) una vez al día y avisa por Telegram
+de las ENTRADAS LONG según esta regla (la misma que el backtest):
+
+  1. El precio estaba bajo la EMA 70 y la cruza al alza.
+  2. Confirmación: la vela SIGUIENTE al cruce cierra al menos `confirmacion_pct` %
+     por encima de la EMA 70. La señal es esa vela de confirmación (última vela cerrada).
+  3. Filtros: volumen, precio mínimo, RSI máximo, mercado (SPY sobre su SMA200),
+     resultados próximos. (ADX y tendencia EMA70/200 desactivados por defecto.)
+
+  Stop sugerido: bajo el mínimo de las últimas 10 velas (máx. 3 ATR; mín. 0,5 ATR).
+  Salida (la haces tú): cuando la EMA 6 vuelva a caer bajo la EMA 70 tras haber subido
+  sobre ella y con un mínimo de `dias_min_salida` velas desde la entrada.
+
+Variables de entorno: bot_token, chat_id  (Telegram).
+Parámetros: DEFAULTS de abajo o un archivo settings_ema70.json (opcional) con las
+claves que quieras cambiar.
+
+Uso:
+    python Bot_long_trullas_server.py                  # escaneo normal
+    python Bot_long_trullas_server.py --sin-telegram   # prueba: imprime en vez de enviar
+    python Bot_long_trullas_server.py --solo intc aapl --sin-telegram
 """
 import argparse
 import html
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -24,24 +42,27 @@ import requests
 import yfinance as yf
 
 # ===========================
-# RUTAS Y ARCHIVOS (Adaptado para PythonAnywhere)
+# RUTAS Y CONSTANTES
 # ===========================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_FILE = os.path.join(BASE_DIR, "assets_trullas.txt")
 HISTORIAL_FILE = os.path.join(BASE_DIR, "historial_senales.json")
-CONFIG_TELEGRAM_FILE = os.path.join(BASE_DIR, "telegram_config.json")
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings_trullas.json")
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings_ema70.json")
 LOG_FILE = os.path.join(BASE_DIR, "senal_long_trullas.log")
+
+TAMANO_LOTE = 40            # tickers por petición a Yahoo
+MIN_VELAS = 210             # historial mínimo para calentar la EMA 200
+DIAS_LIMPIEZA_HISTORIAL = 90
+MODELO = "EMA70"
 
 TELEGRAM_TOKEN = None
 TELEGRAM_CHAT_ID = None
-TAMANO_LOTE = 40          # tickers por petición a Yahoo
-DIAS_LIMPIEZA_HISTORIAL = 90
+ENVIAR_TELEGRAM = True      # --sin-telegram lo pone a False
 
 # ===========================
-# LOGGING (Rotativo, ideal para servidores)
+# LOGGING
 # ===========================
-logger = logging.getLogger("trullas_server")
+logger = logging.getLogger("trullas_ema70")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
     try:
@@ -52,46 +73,55 @@ if not logger.handlers:
         pass
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
+
 def log_consola(texto):
-    """Log dual: pantalla (consola del servidor) + archivo."""
     print(texto)
     logger.info(str(texto).strip())
+
 
 # ===========================
 # CONFIGURACIÓN
 # ===========================
 DEFAULTS = {
-    "estrategia": "EMA",
+    # medias y señal
     "ema_fast": 6, "ema_mid": 70, "ema_slow": 200,
-    "smma_fast": 5, "smma_mid": 20, "smma_slow": 50,
-    "pendiente_barras": 5, "exigir_rapida_sobre_media": True,
+    "confirmacion_pct": 1.0,      # % mínimo sobre la EMA 70 de la vela siguiente al cruce (None = sin confirmación)
+    "exigir_tendencia": False,    # True = exige EMA 70 y 200 subiendo y precio > EMA 200
+    "pendiente_barras": 5,
+    "dias_min_salida": 5,         # solo informativo (se muestra en el aviso)
+    # MACD (solo para la puntuación)
     "macd_fast": 12, "macd_slow": 26, "macd_signal": 9,
-    "solo_nuevas": True, "periodo_datos": "2y", "dias_no_repetir": 2,
-    "atr_periodo": 14, "atr_mult_sl": 1.5, "ratio_tp": 2.0,
+    # datos
+    "periodo_datos": "2y", "dias_no_repetir": 2,
+    # riesgo
+    "atr_periodo": 14, "stop_barras": 10, "stop_max_atr": 3.0, "stop_atr_defecto": 1.5,
     "capital": 10000.0, "riesgo_pct": 1.0,
+    # filtros
     "filtro_volumen": True, "volumen_min": 500000,
     "filtro_precio": True, "precio_min": 5.0,
-    "filtro_adx": True, "adx_min": 20.0,
+    "filtro_adx": False, "adx_min": 20.0,
     "filtro_rsi": True, "rsi_max": 70.0,
     "filtro_mercado": True, "indice_mercado": "SPY",
     "filtro_resultados": True, "dias_resultados": 5,
     "score_min": 0,
+    # avisos
     "enviar_individuales": True, "enviar_resumen": True,
-    "bt_anos": 5, "bt_max_barras": 20, "bt_comision_pct": 0.1,
 }
+
 
 def cargar_settings():
     p = dict(DEFAULTS)
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                guardado = json.load(f)
-                for k, v in guardado.items():
+                for k, v in json.load(f).items():
                     if k in DEFAULTS:
                         p[k] = v
+            log_consola(f"Parámetros leídos de {os.path.basename(SETTINGS_FILE)}")
         except Exception as e:
             logger.warning(f"No se pudo leer {SETTINGS_FILE}: {e}")
     return p
+
 
 def guardar_json_seguro(ruta, datos):
     carpeta = os.path.dirname(ruta) or "."
@@ -105,42 +135,27 @@ def guardar_json_seguro(ruta, datos):
             os.remove(tmp)
         raise
 
-def guardar_settings(p):
-    guardar_json_seguro(SETTINGS_FILE, p)
 
-def nombre_estrategia(est, p):
-    if est == "EMA":
-        return f"EMA {p['ema_fast']}/{p['ema_mid']}/{p['ema_slow']}"
-    return f"SMMA {p['smma_fast']}/{p['smma_mid']}/{p['smma_slow']}"
+def nombre_modelo(p):
+    conf = p.get("confirmacion_pct")
+    txt_conf = "sin confirmación" if conf is None or float(conf) < 0 else f"confirmación {float(conf):g} %"
+    return f"EMA {p['ema_fast']}/{p['ema_mid']}/{p['ema_slow']} · cruce EMA {p['ema_mid']} + {txt_conf}"
 
-def lista_estrategias(sel):
-    sel = (sel or "EMA").upper()
-    if sel == "AMBAS":
-        return ["EMA", "SMMA"]
-    return [sel if sel in ("EMA", "SMMA") else "EMA"]
 
 # ===========================
 # TELEGRAM
 # ===========================
-
 def cargar_config_telegram():
     global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
     TELEGRAM_TOKEN = os.environ.get("bot_token")
     TELEGRAM_CHAT_ID = os.environ.get("chat_id")
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    if ENVIAR_TELEGRAM and (not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID):
         log_consola("⚠️ No se encontraron 'bot_token' o 'chat_id' en las variables de entorno.")
 
-def _telegram_listo(log):
-    if not TELEGRAM_TOKEN:
-        log("️ Falta 'bot_token' en telegram_config.json.")
-        return False
-    if not TELEGRAM_CHAT_ID:
-        log("⚠️ Falta 'chat_id' en telegram_config.json.")
-        return False
-    return True
 
 def esc(texto):
     return html.escape(str(texto), quote=False)
+
 
 def _trocear(mensaje, limite=4000):
     partes, actual = [], ""
@@ -156,8 +171,13 @@ def _trocear(mensaje, limite=4000):
         partes.append(actual)
     return partes
 
+
 def enviar_telegram(mensaje, log=log_consola):
-    if not _telegram_listo(log):
+    if not ENVIAR_TELEGRAM:
+        print("\n--- (modo prueba, no se envía a Telegram) ---\n" + re.sub(r"<[^>]+>", "", mensaje) + "\n---")
+        return True
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log("⚠️ Faltan bot_token o chat_id: no se puede enviar a Telegram.")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     ok_total = True
@@ -176,6 +196,7 @@ def enviar_telegram(mensaje, log=log_consola):
         log("📨 Mensaje enviado a Telegram.")
     return ok_total
 
+
 def enlace_tradingview(ticker):
     mapa = {".MC": "BME", ".L": "LSE", ".PA": "EURONEXT", ".AS": "EURONEXT",
             ".DE": "XETR", ".MI": "MIL", ".TO": "TSX", ".SW": "SIX", ".LS": "EURONEXT"}
@@ -184,44 +205,51 @@ def enlace_tradingview(ticker):
             return f"https://www.tradingview.com/chart/?symbol={bolsa}:{ticker[:-len(suf)]}"
     return f"https://www.tradingview.com/chart/?symbol={ticker.replace('-', '.')}"
 
+
 def mensaje_senal(r, p):
     t = esc(r["ticker"])
     lineas = [
-        "🟢 <b>[ENTRADA EN COMPRA]</b>", "",
+        "🟢 <b>[ENTRADA LONG · EMA 70]</b>", "",
         f"📊 <b>Ticker:</b> <a href=\"{enlace_tradingview(r['ticker'])}\">{t}</a>",
-        f"🧭 <b>Estrategia:</b> {esc(nombre_estrategia(r['estrategia'], p))}",
-        f"️ <b>Tipo:</b> {esc(r['tipo'])}", f"📅 <b>Vela:</b> {r['fecha']}",
-        f"💰 <b>Precio:</b> {r['precio']:.2f}", f" <b>Stop:</b> {r['sl']:.2f} ({r['sl_pct']:+.1f}%)",
-        f" <b>Objetivo:</b> {r['tp']:.2f} ({r['tp_pct']:+.1f}%)", f"⚖️ <b>R:B</b> 1:{p['ratio_tp']:g}",
-        f" <b>Tamaño:</b> {r['acciones']} acc. (riesgo {r['riesgo_eur']:.0f} €)",
-        f"⭐ <b>Puntuación:</b> {r['score']}/100", f" ADX {r['adx']:.0f} · RSI {r['rsi']:.0f} · Vol x{r['vol_ratio']:.1f}",
+        f"🧭 <b>Modelo:</b> {esc(nombre_modelo(p))}",
+        f"📅 <b>Vela de señal:</b> {r['fecha']} (cruce el {r['fecha_cruce']})",
+        f"💰 <b>Cierre:</b> {r['precio']:.2f} · EMA {p['ema_mid']}: {r['ema_m']:.2f} ({r['sobre_ema_pct']:+.1f}% sobre ella)",
+        f"🛑 <b>Stop:</b> {r['sl']:.2f} ({r['sl_pct']:+.1f}%)",
+        f"📦 <b>Tamaño:</b> {r['acciones']} acc. (riesgo {r['riesgo_eur']:.0f} €)",
+        f"🚪 <b>Salida:</b> cuando la EMA {p['ema_fast']} vuelva a caer bajo la EMA {p['ema_mid']} "
+        f"(tras subir sobre ella y mín. {p['dias_min_salida']} velas)",
+        f"⭐ <b>Puntuación:</b> {r['score']}/100",
+        f"ADX {r['adx']:.0f} · RSI {r['rsi']:.0f} · Vol x{r['vol_ratio']:.1f}",
+        "ℹ️ Entrada orientativa: apertura de la siguiente sesión.",
     ]
     if r.get("resultados_dias") is not None:
         lineas.append(f"📆 Resultados en {r['resultados_dias']} días")
     return "\n".join(lineas)
 
-def enviar_resumen_telegram(senales, log=log_consola, p=None, info=None):
-    p = p or DEFAULTS
-    info = info or {}
-    cabecera = [" <b>[RESUMEN ESCANEO]</b>", ""]
-    if info.get("estrategias"):
-        cabecera.append(f"🧭 {esc(info['estrategias'])}")
+
+def enviar_resumen_telegram(senales, info, p, log=log_consola):
+    cab = ["📋 <b>[RESUMEN ESCANEO]</b>", "", f"🧭 {esc(nombre_modelo(p))}"]
     if info.get("mercado") is not None:
         estado = "✅ alcista" if info["mercado"] else "⛔ bajista"
-        cabecera.append(f"🌍 Mercado ({esc(p['indice_mercado'])} vs SMA200): {estado}")
-    if info.get("analizados") is not None:
-        cabecera.append(f" Analizados: {info['analizados']} · Sin datos: {info.get('sin_datos', 0)} · Descartadas: {info.get('descartadas', 0)}")
-    cabecera.append("")
+        cab.append(f"🌍 Mercado ({esc(p['indice_mercado'])} vs SMA200): {estado}")
+    cab.append(f"🔎 Analizados: {info['analizados']} · Sin datos: {info['sin_datos']} · "
+               f"Cruces confirmados hoy: {info['gatillos']} · Descartados por filtros: {info['descartadas']}")
+    if info["motivos"]:
+        cab.append("Motivos: " + ", ".join(f"{k} {v}" for k, v in sorted(info["motivos"].items(), key=lambda x: -x[1])))
+    if info["total"] and info["sin_datos"] / info["total"] > 0.15:
+        cab.append("⚠️ Muchos activos sin datos: posible fallo de Yahoo, revisa el log.")
+    cab.append("")
     if not senales:
-        enviar_telegram("\n".join(cabecera + ["No se han encontrado señales de entrada LONG en este escaneo."]), log=log)
+        enviar_telegram("\n".join(cab + ["No se han encontrado señales de entrada LONG en este escaneo."]), log=log)
         return
-    lineas = cabecera + [f"Se han detectado <b>{len(senales)}</b> señal(es), de mejor a peor:", ""]
+    lineas = cab + [f"Se han detectado <b>{len(senales)}</b> señal(es), de mejor a peor:", ""]
     for n, s in enumerate(sorted(senales, key=lambda x: -x["score"]), start=1):
-        lineas.append(f"{n}. 🟢 <b>{esc(s['ticker'])}</b> ⭐{s['score']} — {s['precio']:.2f} (SL {s['sl']:.2f} / TP {s['tp']:.2f}) — {esc(s['estrategia'])}")
+        lineas.append(f"{n}. 🟢 <b>{esc(s['ticker'])}</b> ⭐{s['score']} — {s['precio']:.2f} (SL {s['sl']:.2f})")
     enviar_telegram("\n".join(lineas), log=log)
 
+
 # ===========================
-# LISTA DE ACTIVOS Y HISTORIAL
+# LISTA DE ACTIVOS E HISTORIAL
 # ===========================
 def normalizar_ticker(t):
     t = (t or "").strip().upper()
@@ -229,6 +257,7 @@ def normalizar_ticker(t):
     if m:
         t = f"{m.group(1)}-{m.group(2)}"
     return t
+
 
 def cargar_activos():
     if not os.path.exists(ASSETS_FILE):
@@ -246,6 +275,7 @@ def cargar_activos():
                 activos.append(t)
     return activos
 
+
 def cargar_historial():
     if not os.path.exists(HISTORIAL_FILE):
         return {}
@@ -255,14 +285,16 @@ def cargar_historial():
     except Exception:
         return {}
 
+
 def guardar_historial(historial):
     try:
         guardar_json_seguro(HISTORIAL_FILE, historial)
     except Exception as e:
         logger.error(f"No se pudo guardar el historial: {e}")
 
-def es_repetida(historial, ticker, estrategia, vela, dias):
-    reg = historial.get(f"{ticker}|{estrategia}")
+
+def es_repetida(historial, ticker, vela, dias):
+    reg = historial.get(f"{ticker}|{MODELO}")
     if not isinstance(reg, dict):
         return False
     if reg.get("vela") == vela:
@@ -273,30 +305,33 @@ def es_repetida(historial, ticker, estrategia, vela, dias):
     except Exception:
         return False
 
-def registrar_senal(historial, ticker, estrategia, vela):
-    historial[f"{ticker}|{estrategia}"] = {"vela": vela, "enviado": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+def registrar_senal(historial, ticker, vela):
+    historial[f"{ticker}|{MODELO}"] = {"vela": vela, "enviado": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
 
 def limpiar_historial(historial):
     limite = datetime.now() - timedelta(days=DIAS_LIMPIEZA_HISTORIAL)
     limpio = {}
     for k, v in historial.items():
-        if not isinstance(v, dict):
-            continue
         try:
-            if datetime.strptime(v["enviado"], "%Y-%m-%d %H:%M:%S") >= limite:
+            if isinstance(v, dict) and datetime.strptime(v["enviado"], "%Y-%m-%d %H:%M:%S") >= limite:
                 limpio[k] = v
         except Exception:
             pass
     return limpio
 
+
 # ===========================
-# INDICADORES Y SEÑALES
+# INDICADORES Y SEÑAL
 # ===========================
 def smma(series, period):
     return series.ewm(alpha=1.0 / period, adjust=False).mean()
 
+
 def ema(series, period):
     return series.ewm(span=period, adjust=False).mean()
+
 
 def calcular_indicadores(df, p):
     df = df.copy()
@@ -304,23 +339,19 @@ def calcular_indicadores(df, p):
     df["ema_f"] = ema(c, int(p["ema_fast"]))
     df["ema_m"] = ema(c, int(p["ema_mid"]))
     df["ema_s"] = ema(c, int(p["ema_slow"]))
-    df["smma_f"] = smma(c, int(p["smma_fast"]))
-    df["smma_m"] = smma(c, int(p["smma_mid"]))
-    df["smma_s"] = smma(c, int(p["smma_slow"]))
     df["macd"] = ema(c, int(p["macd_fast"])) - ema(c, int(p["macd_slow"]))
     df["macd_signal"] = ema(df["macd"], int(p["macd_signal"]))
     df["macd_hist"] = df["macd"] - df["macd_signal"]
-    
+
     delta = c.diff()
     subida = smma(delta.clip(lower=0), 14)
     bajada = smma(-delta.clip(upper=0), 14)
     with np.errstate(divide="ignore", invalid="ignore"):
         df["rsi"] = 100 - 100 / (1 + subida / bajada)
-    
-    n = int(p["atr_periodo"])
+
     prev_c = c.shift(1)
     tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    df["atr"] = smma(tr, n)
+    df["atr"] = smma(tr, int(p["atr_periodo"]))
     up, down = h.diff(), -l.diff()
     plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
     minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
@@ -330,11 +361,12 @@ def calcular_indicadores(df, p):
         minus_di = 100 * smma(minus_dm, 14) / atr14
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     df["adx"] = smma(dx.fillna(0), 14)
-    
+
     vol = df["Volume"] if "Volume" in df.columns else pd.Series(0.0, index=df.index)
     df["Volume"] = vol.fillna(0)
     df["vol_media"] = df["Volume"].rolling(20).mean()
     return df
+
 
 def serie_mercado(df_indice):
     if df_indice is None or df_indice.empty:
@@ -342,6 +374,7 @@ def serie_mercado(df_indice):
     c = df_indice["Close"]
     sma = c.rolling(200).mean()
     return (c > sma) | sma.isna()
+
 
 def _alinear_mercado(mercado, index):
     if mercado is None:
@@ -351,64 +384,85 @@ def _alinear_mercado(mercado, index):
     alineado = m.reindex(m.index.union(index)).ffill().reindex(index)
     return alineado.fillna(1.0) > 0.5
 
-def calcular_senales(df, estrategia, p, mercado=None):
-    pref = "ema" if estrategia == "EMA" else "smma"
-    f, m, s = df[f"{pref}_f"], df[f"{pref}_m"], df[f"{pref}_s"]
-    close = df["Close"]
-    k = max(1, int(p["pendiente_barras"]))
-    lento = int(p[f"{pref}_slow"])
-    tendencia = (m > m.shift(k)) & (s > s.shift(k))
-    cond = tendencia & (close > f) & (df["macd"] > df["macd_signal"])
-    if p["exigir_rapida_sobre_media"]:
-        cond &= f > m
-    calentado = pd.Series(np.arange(len(df)) >= lento, index=df.index)
-    cond = (cond & calentado).astype(bool)
-    previa = cond.shift(1, fill_value=False).astype(bool)
-    nueva = cond & ~previa
-    cruce_ma = (f > m) & (f.shift(1) <= m.shift(1))
-    cruce_macd = (df["macd"] > df["macd_signal"]) & (df["macd"].shift(1) <= df["macd_signal"].shift(1))
-    etiqueta_ma = f"CRUCE_{pref.upper()}{p[pref + '_fast']}_{pref.upper()}{p[pref + '_mid']}"
-    tipo = np.select([cruce_ma.values, cruce_macd.values], [etiqueta_ma, "CRUCE_MACD_ALCISTA"], default="CONFIRMACION_LONG")
-    
-    filtros = pd.DataFrame(index=df.index)
-    if p["filtro_volumen"]: filtros["volumen"] = df["vol_media"] >= float(p["volumen_min"])
-    if p["filtro_precio"]: filtros["precio"] = close >= float(p["precio_min"])
-    if p["filtro_adx"]: filtros["adx"] = df["adx"] >= float(p["adx_min"])
-    if p["filtro_rsi"]: filtros["rsi"] = df["rsi"] <= float(p["rsi_max"])
-    if p["filtro_mercado"]: filtros["mercado"] = _alinear_mercado(mercado, df.index)
-    filtros_ok = filtros.all(axis=1) if len(filtros.columns) else pd.Series(True, index=df.index)
-    
-    return pd.DataFrame({"cond": cond, "nueva": nueva, "tipo": tipo, "filtros_ok": filtros_ok.astype(bool)}, index=df.index).join(filtros.add_prefix("f_"))
 
-def calcular_score(df, i, estrategia, tipo):
-    pref = "ema" if estrategia == "EMA" else "smma"
+def calcular_senal(df, p, mercado=None):
+    """Devuelve, por vela: gatillo (señal EMA 70), filtros_ok y una columna f_* por filtro."""
+    m, s = df["ema_m"], df["ema_s"]
+    close = df["Close"]
+    cruce = (close > m) & (close.shift(1) <= m.shift(1))
+    conf = p.get("confirmacion_pct")
+    if conf is None or float(conf) < 0:
+        gatillo = cruce
+    else:
+        gatillo = cruce.shift(1, fill_value=False).astype(bool) & (close >= m * (1 + float(conf) / 100))
+    if p["exigir_tendencia"]:
+        k = max(1, int(p["pendiente_barras"]))
+        gatillo = gatillo & (m > m.shift(k)) & (s > s.shift(k)) & (close > s)
+    calentado = pd.Series(np.arange(len(df)) >= int(p["ema_slow"]), index=df.index)
+    gatillo = (gatillo & calentado).astype(bool)
+
+    filtros = pd.DataFrame(index=df.index)
+    if p["filtro_volumen"]:
+        filtros["volumen"] = df["vol_media"] >= float(p["volumen_min"])
+    if p["filtro_precio"]:
+        filtros["precio"] = close >= float(p["precio_min"])
+    if p["filtro_adx"]:
+        filtros["adx"] = df["adx"] >= float(p["adx_min"])
+    if p["filtro_rsi"]:
+        filtros["rsi"] = df["rsi"] <= float(p["rsi_max"])
+    if p["filtro_mercado"]:
+        filtros["mercado"] = _alinear_mercado(mercado, df.index)
+    filtros_ok = filtros.all(axis=1) if len(filtros.columns) else pd.Series(True, index=df.index)
+    sal = pd.DataFrame({"gatillo": gatillo, "filtros_ok": filtros_ok.astype(bool)}, index=df.index)
+    return sal.join(filtros.add_prefix("f_"))
+
+
+def calcular_score(df, i):
     r, ant = df.iloc[i], df.iloc[i - 1]
     pts = 0.0
-    if pd.notna(r["adx"]): pts += 25 * min(max((r["adx"] - 10) / 30, 0), 1)
+    if pd.notna(r["adx"]):
+        pts += 25 * min(max((r["adx"] - 10) / 30, 0), 1)
     if pd.notna(r["vol_media"]) and r["vol_media"] > 0:
         pts += 15 * min(max((r["Volume"] / r["vol_media"] - 0.5) / 1.5, 0), 1)
     rsi = r["rsi"]
     if pd.notna(rsi):
-        if 50 <= rsi <= 65: pts += 20
-        elif 40 <= rsi < 50 or 65 < rsi <= 70: pts += 12
-        elif rsi < 40: pts += 5
+        if 50 <= rsi <= 65:
+            pts += 20
+        elif 40 <= rsi < 50 or 65 < rsi <= 70:
+            pts += 12
+        elif rsi < 40:
+            pts += 5
     if pd.notna(r["atr"]) and r["atr"] > 0:
-        ext = (r["Close"] - r[f"{pref}_m"]) / r["atr"]
-        if ext < 0: pts += 10
-        elif ext <= 1.5: pts += 20
-        elif ext < 5: pts += 20 * (5 - ext) / 3.5
-    if r["macd_hist"] > ant["macd_hist"]: pts += 10
-    if tipo != "CONFIRMACION_LONG": pts += 10
+        ext = (r["Close"] - r["ema_m"]) / r["atr"]
+        if ext < 0:
+            pts += 10
+        elif ext <= 1.5:
+            pts += 20
+        elif ext < 5:
+            pts += 20 * (5 - ext) / 3.5
+    if r["macd_hist"] > ant["macd_hist"]:
+        pts += 10
+    pts += 10  # señal de cruce (no es una simple continuación)
     return int(round(pts))
 
-def calcular_riesgo(precio, atr, p):
-    riesgo = float(p["atr_mult_sl"]) * atr if atr > 0 else precio * 0.05
-    sl = precio - riesgo
-    tp = precio + float(p["ratio_tp"]) * riesgo
+
+def calcular_stop_y_riesgo(df, i, precio, atr, p):
+    """Stop bajo el mínimo de las últimas N velas (máx. stop_max_atr ATR; mín. 0,5 ATR)."""
+    if not (atr and atr > 0):
+        sl = precio * 0.95
+    else:
+        sl = precio - float(p["stop_atr_defecto"]) * atr
+        n = int(p["stop_barras"])
+        minimo = float(df["Low"].iloc[max(0, i - n + 1): i + 1].min())
+        sl_sw = max(minimo - 0.1 * atr, precio - float(p["stop_max_atr"]) * atr)
+        if precio - sl_sw >= 0.5 * atr:
+            sl = sl_sw
+    riesgo = precio - sl
     riesgo_max = float(p["capital"]) * float(p["riesgo_pct"]) / 100
     acciones = int(riesgo_max // riesgo) if riesgo > 0 else 0
     acciones = max(0, min(acciones, int(float(p["capital"]) // precio) if precio > 0 else 0))
-    return {"sl": sl, "tp": tp, "sl_pct": (sl / precio - 1) * 100, "tp_pct": (tp / precio - 1) * 100, "acciones": acciones, "riesgo_eur": acciones * riesgo}
+    return {"sl": sl, "sl_pct": (sl / precio - 1) * 100, "acciones": acciones, "riesgo_eur": acciones * riesgo}
+
 
 def ultima_vela_cerrada_idx(df, ticker):
     n = len(df)
@@ -432,8 +486,9 @@ def ultima_vela_cerrada_idx(df, ticker):
     except Exception:
         return n - 2
 
+
 # ===========================
-# DESCARGA Y ANÁLISIS
+# DESCARGA
 # ===========================
 def _extraer(data, ticker):
     if data is None or data.empty:
@@ -460,196 +515,196 @@ def _extraer(data, ticker):
     except Exception:
         return None
 
-def descargar_lote(tickers, periodo=None, inicio=None, log=log_consola, stop_event=None):
+
+def descargar_lote(tickers, periodo="2y", log=log_consola):
     resultado = {}
     tickers = list(dict.fromkeys(tickers))
     bloques = [tickers[i:i + TAMANO_LOTE] for i in range(0, len(tickers), TAMANO_LOTE)]
-    kwargs = {"interval": "1d", "group_by": "ticker", "threads": True, "progress": False, "auto_adjust": True}
-    if inicio is not None:
-        kwargs["start"] = pd.Timestamp(inicio).strftime("%Y-%m-%d")
-    else:
-        kwargs["period"] = periodo or "2y"
-    
     for nb, bloque in enumerate(bloques, start=1):
-        if stop_event is not None and stop_event.is_set():
-            break
         data = None
         for intento in range(3):
             try:
-                data = yf.download(bloque, **kwargs)
+                data = yf.download(bloque, period=periodo, interval="1d", group_by="ticker",
+                                   threads=True, progress=False, auto_adjust=True)
                 if data is not None and not data.empty:
                     break
             except Exception as e:
-                log(f"⚠️ Error descargando bloque {nb} (intento {intento + 1}): {e}")
-                time.sleep(2 * (intento + 1))
+                log(f"⚠️ Error descargando bloque {nb}/{len(bloques)} (intento {intento + 1}): {e}")
+            time.sleep(2 * (intento + 1))
+        n_ok = 0
         for t in bloque:
             df = _extraer(data, t)
             if df is not None:
                 resultado[t] = df
+                n_ok += 1
+        if n_ok < len(bloque):
+            log(f"ℹ️ Bloque {nb}/{len(bloques)}: {n_ok}/{len(bloque)} tickers con datos.")
     return resultado
+
 
 def dias_hasta_resultados(ticker):
     try:
         cal = yf.Ticker(ticker).calendar
-        fechas = cal.get("Earnings Date") if isinstance(cal, dict) else (list(cal.loc["Earnings Date"].values) if isinstance(cal, pd.DataFrame) and "Earnings Date" in cal.index else None)
+        fechas = cal.get("Earnings Date") if isinstance(cal, dict) else (
+            list(cal.loc["Earnings Date"].values) if isinstance(cal, pd.DataFrame) and "Earnings Date" in cal.index else None)
         if not fechas:
-            return None, None
+            return None
         if not isinstance(fechas, (list, tuple, np.ndarray)):
             fechas = [fechas]
         hoy = date.today()
         futuras = sorted(d for d in (pd.Timestamp(x).date() for x in fechas) if d >= hoy)
-        if not futuras:
-            return None, None
-        return (futuras[0] - hoy).days, futuras[0]
+        return (futuras[0] - hoy).days if futuras else None
     except Exception:
-        return None, None
+        return None
 
-def analizar_ticker(ticker, dfi, estrategia, p, mercado=None, senales=None):
+
+# ===========================
+# ANÁLISIS DE UN TICKER
+# ===========================
+def analizar_ticker(ticker, dfi, p, mercado=None):
+    """Devuelve None si no hay señal en la última vela cerrada; si la hay, un dict con los datos."""
     i = ultima_vela_cerrada_idx(dfi, ticker)
     if i < 2:
         return None
-    sen = senales if senales is not None else calcular_senales(dfi, estrategia, p, mercado)
-    fila, s = dfi.iloc[i], sen.iloc[i]
-    activa, nueva = bool(s["cond"]), bool(s["nueva"])
-    j = i
-    if activa:
-        cond = sen["cond"].values
-        while j > 0 and cond[j - 1]:
-            j -= 1
-    tipo = str(sen["tipo"].iloc[j]) if activa else "SIN_SEÑAL"
-    precio, atr = float(fila["Close"]), float(fila["atr"]) if pd.notna(fila["atr"]) else float("nan")
-    riesgo = calcular_riesgo(precio, atr, p)
-    vol_ratio = float(fila["Volume"] / fila["vol_media"]) if fila["vol_media"] and pd.notna(fila["vol_media"]) else 0.0
-    filtros = {c[2:]: bool(s[c]) for c in sen.columns if c.startswith("f_")}
+    sen = calcular_senal(dfi, p, mercado)
+    s = sen.iloc[i]
+    if not bool(s["gatillo"]):
+        return None
+    fila = dfi.iloc[i]
+    precio = float(fila["Close"])
+    atr = float(fila["atr"]) if pd.notna(fila["atr"]) else float("nan")
+    conf = p.get("confirmacion_pct")
+    i_cruce = i if (conf is None or float(conf) < 0) else i - 1
+    vol_ratio = float(fila["Volume"] / fila["vol_media"]) if pd.notna(fila["vol_media"]) and fila["vol_media"] else 0.0
     res = {
-        "ticker": ticker, "estrategia": estrategia, "activa": activa, "nueva": nueva, "tipo": tipo,
-        "desde": dfi.index[j].strftime("%d/%m/%Y"), "velas_activa": i - j + 1, "fecha": dfi.index[i].strftime("%d/%m/%Y"),
-        "vela": dfi.index[i].strftime("%Y-%m-%d"), "idx": i, "precio": precio, "atr": atr,
-        "adx": float(fila["adx"]) if pd.notna(fila["adx"]) else 0.0, "rsi": float(fila["rsi"]) if pd.notna(fila["rsi"]) else 0.0,
-        "vol_ratio": vol_ratio, "filtros": filtros, "filtros_ok": bool(s["filtros_ok"]),
-        "score": calcular_score(dfi, i, estrategia, tipo) if activa else 0, "resultados_dias": None,
+        "ticker": ticker,
+        "fecha": dfi.index[i].strftime("%d/%m/%Y"),
+        "vela": dfi.index[i].strftime("%Y-%m-%d"),
+        "fecha_cruce": dfi.index[i_cruce].strftime("%d/%m/%Y"),
+        "precio": precio, "atr": atr,
+        "ema_m": float(fila["ema_m"]), "sobre_ema_pct": (precio / float(fila["ema_m"]) - 1) * 100,
+        "adx": float(fila["adx"]) if pd.notna(fila["adx"]) else 0.0,
+        "rsi": float(fila["rsi"]) if pd.notna(fila["rsi"]) else 0.0,
+        "vol_ratio": vol_ratio,
+        "filtros": {c[2:]: bool(s[c]) for c in sen.columns if c.startswith("f_")},
+        "filtros_ok": bool(s["filtros_ok"]),
+        "score": calcular_score(dfi, i), "resultados_dias": None,
     }
-    res.update(riesgo)
-    if activa and not nueva:
-        res["tipo"] = f"{tipo} (activa desde {res['desde']})"
+    res.update(calcular_stop_y_riesgo(dfi, i, precio, atr, p))
     return res
 
+
 # ===========================
-# ESCANEO PRINCIPAL (Headless)
+# ESCANEO PRINCIPAL
 # ===========================
-def ejecutar_escaneo(log=log_consola, p=None, estrategias=None, stop_event=None):
-    p = p or cargar_settings()
-    estrategias = estrategias or lista_estrategias(p["estrategia"])
-    nombres = " + ".join(nombre_estrategia(e, p) for e in estrategias)
+def ejecutar_escaneo(p, solo=None, log=log_consola):
     log("=" * 60)
-    log(f"🚀 INICIANDO ESCANEO ENTRADAS LONG — {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
-    log(f"🧭 Estrategia: {nombres}")
+    log(f"🚀 INICIANDO ESCANEO — {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    log(f"🧭 Modelo: {nombre_modelo(p)}")
     log("=" * 60)
-    
-    activos = cargar_activos()
+
+    activos = [normalizar_ticker(t) for t in solo] if solo else cargar_activos()
     if not activos:
-        log("️ La lista de activos está vacía.")
-        return [], {}, None
-        
+        log("⚠️ La lista de activos está vacía.")
+        return []
     indice = normalizar_ticker(p["indice_mercado"])
     lista = list(activos) + ([indice] if p["filtro_mercado"] and indice not in activos else [])
-    
+
     t0 = time.time()
-    datos = descargar_lote(lista, periodo=p["periodo_datos"], log=log, stop_event=stop_event)
+    datos = descargar_lote(lista, periodo=p["periodo_datos"], log=log)
     log(f"⬇️ Descargados {len(datos)}/{len(lista)} tickers en {time.time() - t0:.1f} s")
-    
+
     mercado, estado_mercado = None, None
     if p["filtro_mercado"]:
         mercado = serie_mercado(datos.get(indice))
         if mercado is None:
-            log(f"️ No hay datos de {indice}: el filtro de mercado se ignora.")
+            log(f"⚠️ No hay datos de {indice}: el filtro de mercado se ignora.")
         else:
             estado_mercado = bool(mercado.iloc[-1])
-            log(f"🌍 Mercado ({indice} vs SMA200): {'ALCISTA ✅' if estado_mercado else 'BAJISTA '}")
-            
+            log(f"🌍 Mercado ({indice} vs SMA200): {'ALCISTA ✅' if estado_mercado else 'BAJISTA ⛔'}")
+
     historial = cargar_historial()
-    senales, cache = [], {}
-    sin_datos = descartadas = 0
-    total = len(activos)
-    
-    for idx, ticker in enumerate(activos, start=1):
-        if stop_event is not None and stop_event.is_set():
-            log("\n⏹️ Escaneo detenido.")
-            break
+    senales, motivos = [], {}
+    sin_datos = gatillos = descartadas = 0
+
+    for ticker in activos:
         try:
             df = datos.get(ticker)
-            if df is None or len(df) < 60:
+            if df is None or len(df) < MIN_VELAS:
                 sin_datos += 1
                 continue
             dfi = calcular_indicadores(df, p)
-            cache[ticker] = dfi
-            for est in estrategias:
-                r = analizar_ticker(ticker, dfi, est, p, mercado)
-                if r is None:
-                    continue
-                visible = r["nueva"] if p["solo_nuevas"] else r["activa"]
-                if not visible:
-                    continue
-                if not r["filtros_ok"]:
-                    descartadas += 1
-                    continue
-                if r["score"] < int(p["score_min"]):
-                    descartadas += 1
-                    continue
-                    
-                dias, _ = dias_hasta_resultados(ticker)
-                r["resultados_dias"] = dias
-                if p["filtro_resultados"] and dias is not None and dias <= int(p["dias_resultados"]):
-                    descartadas += 1
-                    continue
-                    
-                senales.append(r)
-                log(f"🟢 {ticker:<10} [{est}] ENTRADA LONG @ {r['precio']:.2f} · SL {r['sl']:.2f} · TP {r['tp']:.2f} · ⭐{r['score']}")
+            r = analizar_ticker(ticker, dfi, p, mercado)
+            if r is None:
+                continue
+            gatillos += 1
+            if not r["filtros_ok"]:
+                descartadas += 1
+                falla = [k for k, ok in r["filtros"].items() if not ok]
+                for k in falla:
+                    motivos[k] = motivos.get(k, 0) + 1
+                log(f"⏭️ {ticker:<10} cruce confirmado pero descartado por filtro: {', '.join(falla)}")
+                continue
+            if r["score"] < int(p["score_min"]):
+                descartadas += 1
+                motivos["score"] = motivos.get("score", 0) + 1
+                continue
+            dias = dias_hasta_resultados(ticker)
+            r["resultados_dias"] = dias
+            if p["filtro_resultados"] and dias is not None and dias <= int(p["dias_resultados"]):
+                descartadas += 1
+                motivos["resultados"] = motivos.get("resultados", 0) + 1
+                log(f"⏭️ {ticker:<10} descartado: resultados en {dias} días")
+                continue
+            senales.append(r)
+            log(f"🟢 {ticker:<10} ENTRADA LONG @ {r['precio']:.2f} · SL {r['sl']:.2f} · ⭐{r['score']}")
         except Exception as e:
             log(f"⚠️ {ticker}: error inesperado: {e}")
             logger.exception(f"Error analizando {ticker}")
-            
+
     senales.sort(key=lambda s: -s["score"])
-    
-    # --- Avisos individuales ---
+
     if p["enviar_individuales"]:
         for r in senales:
-            if es_repetida(historial, r["ticker"], r["estrategia"], r["vela"], int(p["dias_no_repetir"])):
-                log(f"⏭️ {r['ticker']} [{r['estrategia']}] ya avisada (anti-spam).")
+            if es_repetida(historial, r["ticker"], r["vela"], int(p["dias_no_repetir"])):
+                log(f"⏭️ {r['ticker']} ya avisada (anti-spam).")
                 continue
-            texto = mensaje_senal(r, p)
-            enviado = enviar_telegram(texto, log=log)
-            if enviado:
-                registrar_senal(historial, r["ticker"], r["estrategia"], r["vela"])
-                
+            if enviar_telegram(mensaje_senal(r, p), log=log):
+                registrar_senal(historial, r["ticker"], r["vela"])
     guardar_historial(limpiar_historial(historial))
-    
+
     if p["enviar_resumen"]:
-        enviar_resumen_telegram(senales, log=log, p=p, info={
-            "estrategias": nombres, "mercado": estado_mercado,
-            "analizados": total - sin_datos, "sin_datos": sin_datos, "descartadas": descartadas
-        })
-        
+        enviar_resumen_telegram(senales, {
+            "mercado": estado_mercado, "analizados": len(activos) - sin_datos, "sin_datos": sin_datos,
+            "gatillos": gatillos, "descartadas": descartadas, "motivos": motivos, "total": len(activos),
+        }, p, log=log)
+
     log("\n✔ Escaneo finalizado.")
     log(f"📋 {len(senales)} señal(es) · {descartadas} descartada(s) · {sin_datos} sin datos.\n")
-    return senales, cache, mercado
+    return senales
+
 
 # ===========================
-# MAIN (Entry Point para Servidor)
+# MAIN
 # ===========================
 def main():
-    parser = argparse.ArgumentParser(description="Escáner de entradas LONG Trullas PRO (Versión Servidor)")
-    parser.add_argument("--estrategia", choices=["EMA", "SMMA", "AMBAS"], type=str.upper, help="Estrategia a usar (por defecto la guardada en settings)")
-    args = parser.parse_args()
-    
+    global ENVIAR_TELEGRAM
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    ap = argparse.ArgumentParser(description="Escáner de entradas LONG — modelo EMA 70")
+    ap.add_argument("--sin-telegram", action="store_true", help="Prueba: imprime los avisos en vez de enviarlos")
+    ap.add_argument("--solo", nargs="+", metavar="TICKER", help="Escanear solo estos tickers (en vez de assets_trullas.txt)")
+    args = ap.parse_args()
+    if args.sin_telegram:
+        ENVIAR_TELEGRAM = False
+
     try:
         cargar_config_telegram()
         p = cargar_settings()
-        est = lista_estrategias(args.estrategia or p["estrategia"])
-        
         log_consola("Iniciando bot en modo servidor (headless)...")
-        ejecutar_escaneo(p=p, estrategias=est)
-        
+        ejecutar_escaneo(p, solo=args.solo)
     except Exception as e:
         error_msg = f"❌ <b>Error crítico en el escáner</b>\n{html.escape(str(e))}"
         log_consola(error_msg)
@@ -659,6 +714,7 @@ def main():
         except Exception:
             pass
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
